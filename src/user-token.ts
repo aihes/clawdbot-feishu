@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FeishuDomain } from "./types.js";
+import { getAuthLogger } from "./feishu-auth-debug.js";
 
 // ============ Types ============
 
@@ -29,6 +30,15 @@ export function resolveAuthorizeBaseUrl(domain: FeishuDomain | undefined): strin
   if (domain === "lark") return "https://open.larksuite.com";
   if (domain === "feishu" || !domain) return "https://open.feishu.cn";
   return domain.replace(/\/+$/, "");
+}
+
+// ============ Internal log helper ============
+
+function log(level: "info" | "error", msg: string, detail?: Record<string, unknown>): void {
+  const authLog = getAuthLogger();
+  if (!authLog) return;
+  if (level === "info") authLog.info(msg, detail);
+  else authLog.error(msg, detail);
 }
 
 // ============ User Token Store ============
@@ -60,7 +70,12 @@ export class UserTokenStore {
    * Loads tokens from the new path; does not clear in-memory state until load() runs.
    */
   reinitialize(newFilePath: string): void {
+    const oldPath = this.filePath;
     this.filePath = path.resolve(newFilePath);
+    log("info", "[TokenStore] reinitialize", {
+      oldPath,
+      newPath: this.filePath,
+    });
     this.load();
   }
 
@@ -68,14 +83,42 @@ export class UserTokenStore {
    * Load tokens from disk. Called once on construction and from reinitialize().
    */
   load(): void {
+    const absPath = path.resolve(this.filePath);
+    const fileExists = fs.existsSync(absPath);
+    log("info", "[TokenStore] load", {
+      filePath: absPath,
+      fileExists,
+    });
+
+    if (!fileExists) {
+      log("info", "[TokenStore] load: file not found, starting with empty store", { filePath: absPath });
+      this.tokens = new Map();
+      return;
+    }
+
     try {
-      if (fs.existsSync(this.filePath)) {
-        const raw = fs.readFileSync(this.filePath, "utf-8");
-        const data = JSON.parse(raw) as Record<string, UserTokenInfo>;
-        this.tokens = new Map(Object.entries(data));
-      }
-    } catch {
-      // If file is corrupt or unreadable, start fresh
+      const raw = fs.readFileSync(absPath, "utf-8");
+      const data = JSON.parse(raw) as Record<string, UserTokenInfo>;
+      const openIds = Object.keys(data);
+      this.tokens = new Map(Object.entries(data));
+
+      const now = Date.now();
+      const summary = openIds.map((id) => {
+        const info = data[id];
+        const expired = info.expires_at <= now;
+        return `${id}(${expired ? "EXPIRED" : "valid"}, expires=${new Date(info.expires_at).toISOString()})`;
+      });
+
+      log("info", "[TokenStore] load: loaded tokens", {
+        filePath: absPath,
+        tokenCount: openIds.length,
+        tokens: summary.join(", "),
+      });
+    } catch (err) {
+      log("error", "[TokenStore] load: failed to parse token file, starting fresh", {
+        filePath: absPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
       this.tokens = new Map();
     }
   }
@@ -84,15 +127,23 @@ export class UserTokenStore {
    * Save tokens to disk (write-through on every mutation).
    */
   private save(): void {
+    const absPath = path.resolve(this.filePath);
     try {
-      const dir = path.dirname(this.filePath);
+      const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
       const data = Object.fromEntries(this.tokens);
-      fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2), "utf-8");
-    } catch {
-      // Silent failure on save - token will still be in memory
+      fs.writeFileSync(absPath, JSON.stringify(data, null, 2), "utf-8");
+      log("info", "[TokenStore] save: written to disk", {
+        filePath: absPath,
+        tokenCount: this.tokens.size,
+      });
+    } catch (err) {
+      log("error", "[TokenStore] save: failed to write", {
+        filePath: absPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -101,8 +152,28 @@ export class UserTokenStore {
    */
   getToken(openId: string): UserTokenInfo | null {
     const info = this.tokens.get(openId);
-    if (!info) return null;
-    if (info.expires_at <= Date.now()) return null;
+    if (!info) {
+      log("info", "[TokenStore] getToken: not found", {
+        openId,
+        filePath: this.getFilePath(),
+        storedOpenIds: [...this.tokens.keys()].join(", ") || "(empty)",
+      });
+      return null;
+    }
+    const now = Date.now();
+    if (info.expires_at <= now) {
+      log("info", "[TokenStore] getToken: token expired", {
+        openId,
+        expiredAt: new Date(info.expires_at).toISOString(),
+        expiredAgoMs: now - info.expires_at,
+      });
+      return null;
+    }
+    log("info", "[TokenStore] getToken: found valid token", {
+      openId,
+      expiresAt: new Date(info.expires_at).toISOString(),
+      remainingMs: info.expires_at - now,
+    });
     return info;
   }
 
@@ -110,6 +181,12 @@ export class UserTokenStore {
    * Store token info for a user (persists to disk).
    */
   setToken(openId: string, info: UserTokenInfo): void {
+    log("info", "[TokenStore] setToken", {
+      openId,
+      filePath: this.getFilePath(),
+      expiresAt: new Date(info.expires_at).toISOString(),
+      hasRefreshToken: Boolean(info.refresh_token),
+    });
     this.tokens.set(openId, info);
     this.save();
   }
@@ -118,6 +195,11 @@ export class UserTokenStore {
    * Remove a user's token (persists to disk).
    */
   removeToken(openId: string): void {
+    log("info", "[TokenStore] removeToken", {
+      openId,
+      filePath: this.getFilePath(),
+      existed: this.tokens.has(openId),
+    });
     this.tokens.delete(openId);
     this.save();
   }
@@ -140,9 +222,16 @@ export class UserTokenStore {
     domain: FeishuDomain | undefined,
   ): Promise<UserTokenInfo | null> {
     const existing = this.tokens.get(openId);
-    if (!existing?.refresh_token) return null;
+    if (!existing?.refresh_token) {
+      log("info", "[TokenStore] refreshToken: no refresh_token available", { openId });
+      return null;
+    }
 
     const baseUrl = resolveApiBaseUrl(domain);
+    log("info", "[TokenStore] refreshToken: attempting refresh", {
+      openId,
+      tokenUrl: `${baseUrl}/open-apis/authen/v2/oauth/token`,
+    });
 
     try {
       const response = await fetch(`${baseUrl}/open-apis/authen/v2/oauth/token`, {
@@ -165,7 +254,10 @@ export class UserTokenStore {
       };
 
       if (result.code !== 0 || !result.access_token) {
-        // Refresh failed - remove invalid token
+        log("error", "[TokenStore] refreshToken: refresh failed, removing token", {
+          openId,
+          code: result.code,
+        });
         this.removeToken(openId);
         return null;
       }
@@ -177,9 +269,17 @@ export class UserTokenStore {
         scope: result.scope ?? existing.scope,
       };
 
+      log("info", "[TokenStore] refreshToken: success", {
+        openId,
+        expiresAt: new Date(newInfo.expires_at).toISOString(),
+      });
       this.setToken(openId, newInfo);
       return newInfo;
-    } catch {
+    } catch (err) {
+      log("error", "[TokenStore] refreshToken: exception", {
+        openId,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     }
   }
@@ -195,10 +295,35 @@ export class UserTokenStore {
     appSecret: string,
     domain: FeishuDomain | undefined,
   ): Promise<string | null> {
+    log("info", "[TokenStore] getValidAccessToken: start", {
+      openId,
+      filePath: this.getFilePath(),
+      storedOpenIds: [...this.tokens.keys()].join(", ") || "(empty)",
+      tokenCount: this.tokens.size,
+    });
+
     // Check if current token is still valid (with 5-minute buffer)
     const info = this.tokens.get(openId);
     if (info && info.expires_at > Date.now() + 5 * 60 * 1000) {
+      log("info", "[TokenStore] getValidAccessToken: token valid, returning", {
+        openId,
+        expiresAt: new Date(info.expires_at).toISOString(),
+        remainingMinutes: Math.round((info.expires_at - Date.now()) / 60000),
+      });
       return info.access_token;
+    }
+
+    if (info) {
+      log("info", "[TokenStore] getValidAccessToken: token expired or expiring soon", {
+        openId,
+        expiresAt: new Date(info.expires_at).toISOString(),
+        hasRefreshToken: Boolean(info.refresh_token),
+      });
+    } else {
+      log("info", "[TokenStore] getValidAccessToken: no token found for this openId", {
+        openId,
+        storedOpenIds: [...this.tokens.keys()].join(", ") || "(empty)",
+      });
     }
 
     // Try refresh
@@ -207,6 +332,7 @@ export class UserTokenStore {
       if (refreshed) return refreshed.access_token;
     }
 
+    log("info", "[TokenStore] getValidAccessToken: returning null (no valid token)", { openId });
     return null;
   }
 }

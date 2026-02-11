@@ -1,8 +1,10 @@
+import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createFeishuClient } from "./client.js";
 import { listEnabledFeishuAccounts } from "./accounts.js";
 import { resolveToolsConfig } from "./tools-config.js";
 import { userTokenStore, resolveApiBaseUrl } from "./user-token.js";
+import { getAuthLogger } from "./feishu-auth-debug.js";
 import { FeishuMinutesSchema, type FeishuMinutesParams } from "./minutes-schema.js";
 
 // ============ Helpers ============
@@ -120,6 +122,13 @@ export function registerFeishuMinutesTools(api: OpenClawPluginApi) {
     return;
   }
 
+  const userAuthCfg = (firstAccount.config as Record<string, unknown>).userAuth as
+    | { tokenStorePath?: string }
+    | undefined;
+  if (userAuthCfg?.tokenStorePath) {
+    userTokenStore.reinitialize(path.resolve(userAuthCfg.tokenStorePath));
+  }
+
   const apiBaseUrl = resolveApiBaseUrl(firstAccount.domain);
 
   api.registerTool(
@@ -138,9 +147,9 @@ export function registerFeishuMinutesTools(api: OpenClawPluginApi) {
           const needTimestamp = p.need_timestamp ?? false;
           const fileFormat = p.file_format ?? "txt";
 
-          let usedTenantToken = false;
+          const tokenStorePath = userTokenStore.getFilePath();
+          const authLog = getAuthLogger();
 
-          // Try user token first
           const userAccessToken = await userTokenStore.getValidAccessToken(
             p.open_id,
             firstAccount.appId!,
@@ -148,6 +157,17 @@ export function registerFeishuMinutesTools(api: OpenClawPluginApi) {
             firstAccount.domain,
           );
 
+          authLog?.info("[Minutes] Token lookup", {
+            openId: p.open_id,
+            tokenStorePath,
+            tokenFound: Boolean(userAccessToken),
+            minutesToken: p.minutes_token,
+          });
+          api.logger.info?.(
+            `[Minutes] open_id=${p.open_id} tokenStorePath=${tokenStorePath} tokenFound=${Boolean(userAccessToken)}`,
+          );
+
+          let usedTenantToken = false;
           let result: FetchTranscriptResult;
 
           if (userAccessToken) {
@@ -189,12 +209,22 @@ export function registerFeishuMinutesTools(api: OpenClawPluginApi) {
           }
 
           if (!result.success) {
-            const hint =
-              !userAccessToken
-                ? " The user has not authorized yet. Use feishu_user_auth with action: 'authorize' to get an OAuth URL."
-                : "";
+            const hint = !userAccessToken
+              ? ` No user token for open_id=${p.open_id}. Token 从该路径读取: ${tokenStorePath}。请确认该用户已完成 feishu_user_auth 授权，且 minutes 调用时传入的 open_id 与授权用户一致。`
+              : "";
+            authLog?.error("[Minutes] Transcript failed", {
+              openId: p.open_id,
+              tokenStorePath,
+              errorCode: result.errorCode,
+              errorMsg: result.errorMsg,
+            });
             return json({
               error: `Failed to get minutes transcript: [${result.errorCode}] ${result.errorMsg}${hint}`,
+              debug: {
+                open_id_used: p.open_id,
+                token_store_path: tokenStorePath,
+                user_token_used: Boolean(userAccessToken),
+              },
             });
           }
 

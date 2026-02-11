@@ -369,6 +369,7 @@ export function startAuthCallbackServer(
 
       logInfo(logger, "[STEP 5/5] Token stored", {
         openId: stateData.openId,
+        tokenStorePath: userTokenStore.getFilePath(),
         expiresAt: new Date(tokenInfo.expires_at).toISOString(),
         hasRefreshToken: Boolean(tokenInfo.refresh_token),
       });

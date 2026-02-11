@@ -5,6 +5,7 @@ import { resolveToolsConfig } from "./tools-config.js";
 import { userTokenStore } from "./user-token.js";
 import { buildAuthorizeUrl, startAuthCallbackServer, getNonceFilePath, type UserAuthConfig } from "./user-auth.js";
 import { createAuthFileLogger, getAuthLogFilePath } from "./user-auth-logger.js";
+import { setAuthLogger } from "./feishu-auth-debug.js";
 import { sendMessageFeishu } from "./send.js";
 import { FeishuUserAuthSchema, type FeishuUserAuthParams } from "./user-auth-schema.js";
 
@@ -50,6 +51,7 @@ export function registerFeishuUserAuthTools(api: OpenClawPluginApi) {
   const logFilePath = getAuthLogFilePath(tokenStorePath);
   const logFilePathAbsolute = path.resolve(logFilePath);
   const authLogger = createAuthFileLogger(logFilePathAbsolute, api.logger);
+  setAuthLogger(authLogger);
 
   // Initialize token store to configured path so tokens save where user expects
   if (tokenStorePath) {
@@ -77,9 +79,10 @@ export function registerFeishuUserAuthTools(api: OpenClawPluginApi) {
     hint: "Ensure redirect_uri is whitelisted in Feishu Open Platform (OAuth redirect URL)",
   });
 
-  api.logger.info?.(
-    `[UserAuth] 日志文件路径 (auth log file): ${logFilePathAbsolute}`,
-  );
+  api.logger.info?.("[UserAuth] 路径汇总 (paths):");
+  api.logger.info?.(`  Token 存储路径 (token store): ${actualTokenPath}`);
+  api.logger.info?.(`  授权日志路径 (auth log file): ${logFilePathAbsolute}`);
+  api.logger.info?.(`  Nonce 文件路径 (nonce file): ${nonceFilePath}`);
 
   startAuthCallbackServer(firstAccount, userAuthCfg, authLogger);
 
