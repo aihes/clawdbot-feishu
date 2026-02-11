@@ -77,13 +77,14 @@ const NONCE_TTL_MS = 10 * 60 * 1000;
 
 const NONCE_FILE_NAME = "feishu-pending-nonces.json";
 
-export function getNonceFilePath(_config: UserAuthConfig): string {
-  // Use the actual resolved token file path so nonce file sits alongside the token file,
-  // even if tokenStorePath was a directory that got resolved.
+/**
+ * Resolve the nonce file path. Uses the actual resolved token store file path
+ * so the nonce file sits alongside the token file.
+ */
+export function getNonceFilePath(): string {
   const tokenFilePath = userTokenStore.getFilePath();
   const dir = path.dirname(tokenFilePath);
-  const result = path.join(dir, NONCE_FILE_NAME);
-  return result;
+  return path.join(dir, NONCE_FILE_NAME);
 }
 
 type NonceEntry = { openId: string; accountId: string; createdAt: number };
@@ -152,24 +153,25 @@ function generateNonce(): string {
   return crypto.randomBytes(16).toString("hex");
 }
 
-/** Add a nonce (persisted to file so callback works after restart or on another instance). */
+/**
+ * Add a nonce (persisted to file so callback works after restart or on another instance).
+ * @param nonceFilePath - Absolute path to the nonce file (resolved once at registration).
+ */
 function addPendingNonce(
-  config: UserAuthConfig,
+  nonceFilePath: string,
   nonce: string,
   openId: string,
   accountId: string,
   logger?: UserAuthLogger,
 ): void {
-  const filePath = getNonceFilePath(config);
   logInfo(logger, "[Nonce] addPendingNonce: start", {
     noncePrefix: nonce.slice(0, 8) + "...",
     openId,
     accountId,
-    nonceFilePath: filePath,
-    tokenStoreFilePath: userTokenStore.getFilePath(),
+    nonceFilePath,
   });
 
-  const map = loadPendingNonces(filePath, logger);
+  const map = loadPendingNonces(nonceFilePath, logger);
   const now = Date.now();
   // Remove expired entries before adding
   let expiredCount = 0;
@@ -183,32 +185,31 @@ function addPendingNonce(
     logInfo(logger, "[Nonce] addPendingNonce: cleaned expired nonces", { expiredCount });
   }
   map.set(nonce, { openId, accountId, createdAt: now });
-  savePendingNonces(filePath, map, logger);
+  savePendingNonces(nonceFilePath, map, logger);
 
   logInfo(logger, "[Nonce] addPendingNonce: done", {
     noncePrefix: nonce.slice(0, 8) + "...",
     totalNonces: map.size,
-    nonceFilePath: filePath,
+    nonceFilePath,
   });
 }
 
 /**
  * Consume a nonce: validate, remove from store, return openId/accountId.
  * Returns null if nonce missing or expired.
+ * @param nonceFilePath - Absolute path to the nonce file (resolved once at registration).
  */
 function consumePendingNonce(
-  config: UserAuthConfig,
+  nonceFilePath: string,
   nonce: string,
   logger?: UserAuthLogger,
 ): { openId: string; accountId: string } | null {
-  const filePath = getNonceFilePath(config);
   logInfo(logger, "[Nonce] consumePendingNonce: start", {
     noncePrefix: nonce.slice(0, 8) + "...",
-    nonceFilePath: filePath,
-    tokenStoreFilePath: userTokenStore.getFilePath(),
+    nonceFilePath,
   });
 
-  const map = loadPendingNonces(filePath, logger);
+  const map = loadPendingNonces(nonceFilePath, logger);
   logInfo(logger, "[Nonce] consumePendingNonce: loaded nonces", {
     count: map.size,
     nonces: [...map.keys()].map((k) => k.slice(0, 8) + "...").join(", ") || "(none)",
@@ -220,7 +221,7 @@ function consumePendingNonce(
   if (!info) {
     logError(logger, "[Nonce] consumePendingNonce: nonce NOT FOUND in file", {
       noncePrefix: nonce.slice(0, 8) + "...",
-      nonceFilePath: filePath,
+      nonceFilePath,
       storedNonceCount: map.size,
       storedNoncePrefixes: [...map.keys()].map((k) => k.slice(0, 8) + "...").join(", ") || "(none)",
       hint: "Nonce was never saved, or saved to a different file. Check addPendingNonce logs above.",
@@ -235,11 +236,11 @@ function consumePendingNonce(
       expiredAgoMs: now - info.createdAt - NONCE_TTL_MS,
     });
     map.delete(nonce);
-    savePendingNonces(filePath, map, logger);
+    savePendingNonces(nonceFilePath, map, logger);
     return null;
   }
   map.delete(nonce);
-  savePendingNonces(filePath, map, logger);
+  savePendingNonces(nonceFilePath, map, logger);
   logInfo(logger, "[Nonce] consumePendingNonce: SUCCESS", {
     noncePrefix: nonce.slice(0, 8) + "...",
     openId: info.openId,
@@ -253,15 +254,17 @@ function consumePendingNonce(
 /**
  * Build the OAuth authorize URL for a user.
  * The state parameter encodes openId, accountId, and a CSRF nonce.
+ * @param nonceFilePath - Absolute path to the nonce file (resolved once at registration).
  */
 export function buildAuthorizeUrl(
   openId: string,
   account: ResolvedFeishuAccount,
   config: UserAuthConfig,
+  nonceFilePath: string,
   logger?: UserAuthLogger,
 ): string {
   const nonce = generateNonce();
-  addPendingNonce(config, nonce, openId, account.accountId, logger);
+  addPendingNonce(nonceFilePath, nonce, openId, account.accountId, logger);
 
   const host = config.callbackHost ?? DEFAULT_CALLBACK_HOST;
   const port = config.callbackPort ?? DEFAULT_CALLBACK_PORT;
@@ -297,10 +300,12 @@ let callbackServer: http.Server | null = null;
 /**
  * Start the OAuth callback HTTP server.
  * Handles the redirect from Feishu OAuth, exchanges code for token, stores it.
+ * @param nonceFilePath - Absolute path to the nonce file (resolved once at registration).
  */
 export function startAuthCallbackServer(
   account: ResolvedFeishuAccount,
   config: UserAuthConfig,
+  nonceFilePath: string,
   logger?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
 ): http.Server {
   if (callbackServer) {
@@ -310,6 +315,9 @@ export function startAuthCallbackServer(
   const port = config.callbackPort ?? DEFAULT_CALLBACK_PORT;
   const callbackPath = config.callbackPath ?? DEFAULT_CALLBACK_PATH;
   const host = config.callbackHost ?? DEFAULT_CALLBACK_HOST;
+
+  // Log the resolved nonce file path that this callback server will use
+  logInfo(logger, "Callback server will use nonce file", { nonceFilePath });
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -360,14 +368,13 @@ export function startAuthCallbackServer(
       return;
     }
 
-    // Validate and consume nonce (CSRF protection). File-persisted so it works after restart / multi-instance.
-    const consumed = consumePendingNonce(config, stateData.nonce, logger);
+    // Validate and consume nonce (CSRF protection). Uses the nonceFilePath captured at server creation time.
+    const consumed = consumePendingNonce(nonceFilePath, stateData.nonce, logger);
     if (!consumed) {
-      const filePath = getNonceFilePath(config);
       logError(logger, "[STEP 3/5] Invalid or expired nonce — see [Nonce] logs above for detailed diagnosis", {
         openId: stateData.openId,
         noncePrefix: stateData.nonce?.slice(0, 8) + "...",
-        nonceFilePath: filePath,
+        nonceFilePath,
         tokenStoreFilePath: userTokenStore.getFilePath(),
       });
       res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });

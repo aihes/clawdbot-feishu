@@ -58,7 +58,10 @@ export function registerFeishuUserAuthTools(api: OpenClawPluginApi) {
     userTokenStore.reinitialize(tokenStorePath);
   }
   const actualTokenPath = userTokenStore.getFilePath();
-  const nonceFilePath = getNonceFilePath(userAuthCfg);
+  // Resolve nonce file path ONCE here — it will be passed explicitly to both
+  // buildAuthorizeUrl (save nonce) and startAuthCallbackServer (consume nonce),
+  // ensuring they always use the exact same path, regardless of module caching.
+  const nonceFilePath = getNonceFilePath();
 
   const port = userAuthCfg.callbackPort ?? 16688;
   const host = userAuthCfg.callbackHost ?? "localhost";
@@ -84,7 +87,7 @@ export function registerFeishuUserAuthTools(api: OpenClawPluginApi) {
   api.logger.info?.(`  授权日志路径 (auth log file): ${logFilePathAbsolute}`);
   api.logger.info?.(`  Nonce 文件路径 (nonce file): ${nonceFilePath}`);
 
-  startAuthCallbackServer(firstAccount, userAuthCfg, authLogger);
+  startAuthCallbackServer(firstAccount, userAuthCfg, nonceFilePath, authLogger);
 
   api.registerTool(
     {
@@ -100,7 +103,7 @@ export function registerFeishuUserAuthTools(api: OpenClawPluginApi) {
         try {
           switch (p.action) {
             case "authorize": {
-              const url = buildAuthorizeUrl(p.open_id, firstAccount, userAuthCfg, authLogger);
+              const url = buildAuthorizeUrl(p.open_id, firstAccount, userAuthCfg, nonceFilePath, authLogger);
               const messageText = `请点击以下链接完成授权（10分钟内有效）：\n${url}`;
               let dmSent = false;
               try {
